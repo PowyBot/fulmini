@@ -32,10 +32,10 @@
 </div>
 <script>
 'use strict';
-// Dielectric breakdown model (Niemeyer, Pietronero, Wiesmann 1984).
-// Il seme della scarica sta a potenziale 0, il bordo a 1. Si risolve Laplace
-// per rilassamento (SOR rosso-nero) e la scarica cresce in una cella vicina
-// con probabilità proporzionale a φ^η. Quando tocca il bordo: colpo di ritorno.
+// Lichtenberg figures with the dielectric breakdown model (Niemeyer, Pietronero, Wiesmann 1984,
+// https://doi.org/10.1103/PhysRevLett.52.1033): the discharge is held at potential 0 and the
+// border at 1; after solving Laplace's equation, the discharge grows into a neighbor cell with
+// probability proportional to the local field to the power eta. Touching the border ends it.
 
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
@@ -43,17 +43,22 @@ const slider = document.getElementById('slider');
 const etaLabel = document.getElementById('eta');
 const hint = document.getElementById('hint');
 
-const MAX_CELLS = 42000;   // griglia ragionevole anche per un telefono
-const LOCAL_R = 14;        // raggio della rilassatura locale dopo ogni crescita
+const FREE = 0, CLUSTER = 1, BORDER = 2;
+
+const MAX_CELLS = 42000;  // keeps one relaxation sweep cheap enough for a phone
+const LOCAL_RADIUS = 14;
 const LOCAL_SWEEPS = 6;
-const GLOBAL_EVERY = 6;    // una passata globale ogni N crescite
+const GLOBAL_SWEEP_EVERY = 6;
+// Successive over-relaxation factor: 1 is plain Gauss-Seidel (too slow), 2 diverges.
+// 1.85 was picked by eye, below the theoretical optimum (~1.97 at these grid sizes).
 const OMEGA = 1.85;
-const FRAME_BUDGET = 9;    // ms di calcolo per frame, al massimo
-const RATE = 900;          // crescite al secondo, se il telefono ce la fa
+const FRAME_BUDGET_MS = 9;
+const GROWTHS_PER_SECOND = 900;
 
-let W, H, phi, fixed, parent, order, cand, candPos, rng, eta, src, done, steps, strike;
-let cssW, cssH, dpr, cell, offX, offY, flash = 0, fadeT = 0, finalPath = null, kids = null;
+let W, H, phi, kind, parent, order, cand, candPos, rng, eta, src, done, steps, strike;
+let cssW, cssH, dpr, cell, offX, offY, flash = 0, fadeT = 0, mainChannel = null, downstream = null;
 
+// mulberry32 by Tommy Ettinger, via https://github.com/bryc/code/blob/master/jshash/PRNGs.md
 function mulberry32(a) {
   return function () {
     a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -66,20 +71,20 @@ function mulberry32(a) {
 function readParams() {
   const q = new URLSearchParams(location.search);
   const num = (k, d) => { const v = parseFloat(q.get(k)); return Number.isFinite(v) ? v : d; };
-  const g = (q.get('g') || '').split('x').map(Number);
+  const grid = (q.get('g') || '').split('x').map(Number);
   return {
     seed: (num('s', Math.floor(Math.random() * 1e9)) >>> 0),
     eta: Math.min(5, Math.max(0.5, num('eta', 1.6))),
     x: Math.min(0.95, Math.max(0.05, num('x', 0.5))),
     y: Math.min(0.95, Math.max(0.05, num('y', 0.5))),
-    g: g.length === 2 && g[0] >= 40 && g[1] >= 40 && g[0] * g[1] <= 90000 ? g : null,
+    grid: grid.length === 2 && grid[0] >= 40 && grid[1] >= 40 && grid[0] * grid[1] <= 90000 ? grid : null,
   };
 }
 
-let P = readParams();
+let params = readParams();
 
 function writeParams() {
-  const q = `?s=${P.seed}&eta=${P.eta.toFixed(1)}&x=${P.x.toFixed(3)}&y=${P.y.toFixed(3)}&g=${W}x${H}`;
+  const q = `?s=${params.seed}&eta=${params.eta.toFixed(1)}&x=${params.x.toFixed(3)}&y=${params.y.toFixed(3)}&g=${W}x${H}`;
   history.replaceState(null, '', location.pathname + q);
 }
 
@@ -92,28 +97,28 @@ function layout() {
   dpr = Math.min(2, window.devicePixelRatio || 1);
   cssW = window.innerWidth; cssH = window.innerHeight;
   canvas.width = Math.round(cssW * dpr); canvas.height = Math.round(cssH * dpr);
-  // la griglia dei link condivisi resta quella originale: si scala e si centra
+  // A shared link keeps its original grid so the figure is reproducible; letterbox it.
   cell = Math.min(canvas.width / W, canvas.height / H);
   offX = (canvas.width - W * cell) / 2; offY = (canvas.height - H * cell) / 2;
 }
 
 function start() {
-  if (!P.g) P.g = gridFor(window.innerWidth, window.innerHeight);
-  [W, H] = P.g;
+  if (!params.grid) params.grid = gridFor(window.innerWidth, window.innerHeight);
+  [W, H] = params.grid;
   layout();
-  eta = P.eta;
-  rng = mulberry32(P.seed);
+  eta = params.eta;
+  rng = mulberry32(params.seed);
   const n = W * H;
-  phi = new Float32Array(n); fixed = new Uint8Array(n); parent = new Int32Array(n).fill(-1);
+  phi = new Float32Array(n); kind = new Uint8Array(n); parent = new Int32Array(n).fill(-1);
   candPos = new Int32Array(n).fill(-1); cand = []; order = [];
-  done = false; steps = 0; strike = -1; finalPath = null; kids = null; flash = 0; fadeT = 0;
-  const sx = Math.round(P.x * (W - 1)), sy = Math.round(P.y * (H - 1));
+  done = false; steps = 0; strike = -1; mainChannel = null; downstream = null; flash = 0; fadeT = 0;
+  const sx = Math.round(params.x * (W - 1)), sy = Math.round(params.y * (H - 1));
   src = sy * W + sx;
-  // stima iniziale logaritmica, poi qualche centinaio di passate per assestarla
+  // Start from the 2D point-charge solution (log r) so a few hundred sweeps are enough.
   const R = Math.hypot(Math.max(sx, W - sx), Math.max(sy, H - sy));
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const i = y * W + x;
-    if (x === 0 || y === 0 || x === W - 1 || y === H - 1) { phi[i] = 1; fixed[i] = 2; continue; }
+    if (x === 0 || y === 0 || x === W - 1 || y === H - 1) { phi[i] = 1; kind[i] = BORDER; continue; }
     const r = Math.max(1, Math.hypot(x - sx, y - sy));
     phi[i] = Math.min(1, Math.log(r) / Math.log(R));
   }
@@ -124,12 +129,13 @@ function start() {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
 }
 
+// Red-black ordering: cells of one color only read cells of the other, so updates in place are safe.
 function sweep(x0, y0, x1, y1) {
   for (let color = 0; color < 2; color++) {
     for (let y = y0; y <= y1; y++) {
       let x = x0 + ((x0 + y + color) & 1);
       for (let i = y * W + x; x <= x1; x += 2, i += 2) {
-        if (fixed[i]) continue;
+        if (kind[i] !== FREE) continue;
         const avg = 0.25 * (phi[i - 1] + phi[i + 1] + phi[i - W] + phi[i + W]);
         phi[i] += OMEGA * (avg - phi[i]);
       }
@@ -137,10 +143,12 @@ function sweep(x0, y0, x1, y1) {
   }
 }
 
+// Approximation: only the window around the new tip is solved properly; far cells catch up
+// at the next global sweep. Exact solving after every growth would be too slow on a phone.
 function relaxAround(i) {
   const x = i % W, y = (i / W) | 0;
-  const x0 = Math.max(1, x - LOCAL_R), x1 = Math.min(W - 2, x + LOCAL_R);
-  const y0 = Math.max(1, y - LOCAL_R), y1 = Math.min(H - 2, y + LOCAL_R);
+  const x0 = Math.max(1, x - LOCAL_RADIUS), x1 = Math.min(W - 2, x + LOCAL_RADIUS);
+  const y0 = Math.max(1, y - LOCAL_RADIUS), y1 = Math.min(H - 2, y + LOCAL_RADIUS);
   for (let k = 0; k < LOCAL_SWEEPS; k++) sweep(x0, y0, x1, y1);
 }
 
@@ -157,7 +165,7 @@ function neighbors(i) {
   return N8;
 }
 
-function removeCand(i) {
+function removeCandidate(i) {
   const p = candPos[i];
   if (p < 0) return;
   const last = cand.pop();
@@ -166,59 +174,64 @@ function removeCand(i) {
 }
 
 function addToCluster(i, from) {
-  removeCand(i);
-  fixed[i] = 1; phi[i] = 0; parent[i] = from; order.push(i);
+  removeCandidate(i);
+  kind[i] = CLUSTER; phi[i] = 0; parent[i] = from; order.push(i);
   for (const j of neighbors(i)) {
-    if (fixed[j] === 1 || candPos[j] >= 0) continue;
-    if (fixed[j] === 2) { if (strike < 0) strike = i; continue; }
+    if (kind[j] === CLUSTER || candPos[j] >= 0) continue;
+    if (kind[j] === BORDER) { if (strike < 0) strike = i; continue; }
     candPos[j] = cand.length; cand.push(j);
   }
 }
 
-function touchesOrtho(i) {
+function touchesClusterOrthogonally(i) {
   const x = i % W;
-  return fixed[i - W] === 1 || fixed[i + W] === 1 || (x > 0 && fixed[i - 1] === 1) || (x < W - 1 && fixed[i + 1] === 1);
+  return kind[i - W] === CLUSTER || kind[i + W] === CLUSTER
+    || (x > 0 && kind[i - 1] === CLUSTER) || (x < W - 1 && kind[i + 1] === CLUSTER);
 }
 
-// genitore: la cella del cluster più vicina (preferendo i vicini ortogonali)
 function pickParent(i) {
   const x = i % W;
   const ortho = [i - W, i + W, x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1];
-  const opts = [];
-  for (const j of ortho) if (j >= 0 && fixed[j] === 1) opts.push(j);
-  if (!opts.length) for (const j of neighbors(i)) if (fixed[j] === 1) opts.push(j);
-  return opts[Math.floor(rng() * opts.length)];
+  const options = [];
+  for (const j of ortho) if (j >= 0 && kind[j] === CLUSTER) options.push(j);
+  if (!options.length) for (const j of neighbors(i)) if (kind[j] === CLUSTER) options.push(j);
+  return options[Math.floor(rng() * options.length)];
 }
 
 function grow() {
   let total = 0;
-  const w = new Float64Array(cand.length);
+  const cumulative = new Float64Array(cand.length);
   for (let k = 0; k < cand.length; k++) {
     const c = cand[k], p = phi[c];
-    // crescita ∝ campo^η, non potenziale^η: un candidato toccato solo in
-    // diagonale è a distanza √2, altrimenti la figura cresce a X lungo le diagonali
-    const v = p > 0 ? Math.pow(touchesOrtho(c) ? p : p * Math.SQRT1_2, eta) : 0;
-    total += v; w[k] = total;
+    // Weight by field^eta, not potential^eta: a diagonal-only candidate is √2 away from the
+    // cluster. Using the potential made figures grow as an X along the diagonals.
+    const field = touchesClusterOrthogonally(c) ? p : p * Math.SQRT1_2;
+    total += p > 0 ? Math.pow(field, eta) : 0;
+    cumulative[k] = total;
   }
   if (total <= 0) { done = true; return -1; }
   const r = rng() * total;
   let lo = 0, hi = cand.length - 1;
-  while (lo < hi) { const m = (lo + hi) >> 1; if (w[m] < r) lo = m + 1; else hi = m; }
+  while (lo < hi) { const m = (lo + hi) >> 1; if (cumulative[m] < r) lo = m + 1; else hi = m; }
   const i = cand[lo];
-  const from = pickParent(i);
-  addToCluster(i, from);
+  addToCluster(i, pickParent(i));
   relaxAround(i);
-  if (++steps % GLOBAL_EVERY === 0) sweep(1, 1, W - 2, H - 2);
+  if (++steps % GLOBAL_SWEEP_EVERY === 0) sweep(1, 1, W - 2, H - 2);
   return i;
 }
 
-// ---- disegno ----
-// ogni cella ha uno spostamento fisso e pseudo-casuale: toglie la scalinata della griglia
-function jit(i, k) { let h = Math.imul(i ^ k, 0x9E3779B1); h ^= h >>> 15; h = Math.imul(h, 0x85EBCA77); h ^= h >>> 13; return ((h >>> 0) / 4294967296 - 0.5) * 0.8; }
-function px(i) { return [offX + (i % W + 0.5 + jit(i, 0x51)) * cell, offY + (((i / W) | 0) + 0.5 + jit(i, 0xA7)) * cell]; }
+// A fixed per-cell offset hides the grid's staircase. Integer hash with the golden-ratio
+// multiplier and the MurmurHash3 finalizer constant.
+function jitter(i, salt) {
+  let h = Math.imul(i ^ salt, 0x9E3779B1); h ^= h >>> 15; h = Math.imul(h, 0x85EBCA77); h ^= h >>> 13;
+  return ((h >>> 0) / 4294967296 - 0.5) * 0.8;
+}
+function toCanvas(i) {
+  return [offX + (i % W + 0.5 + jitter(i, 0x51)) * cell, offY + (((i / W) | 0) + 0.5 + jitter(i, 0xA7)) * cell];
+}
 
 function segment(i, width, color) {
-  const [x0, y0] = px(parent[i]), [x1, y1] = px(i);
+  const [x0, y0] = toCanvas(parent[i]), [x1, y1] = toCanvas(i);
   ctx.strokeStyle = color; ctx.lineWidth = width;
   ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
 }
@@ -233,12 +246,45 @@ function drawNew(list) {
 
 function finish() {
   done = true;
-  // numero di discendenti: i rami che portano più corrente sono più spessi
-  kids = new Uint32Array(W * H);
-  for (let k = order.length - 1; k > 0; k--) { const i = order[k]; kids[i] += 1; kids[parent[i]] += kids[i]; }
-  finalPath = [];
-  if (strike >= 0) for (let i = strike; i >= 0 && parent[i] >= 0; i = parent[i]) finalPath.push(i);
+  // Branches carrying more current are thicker; current ~ number of cells downstream.
+  downstream = new Uint32Array(W * H);
+  for (let k = order.length - 1; k > 0; k--) { const i = order[k]; downstream[i] += 1; downstream[parent[i]] += downstream[i]; }
+  mainChannel = [];
+  if (strike >= 0) for (let i = strike; i >= 0 && parent[i] >= 0; i = parent[i]) mainChannel.push(i);
   flash = 1;
+}
+
+function drawBranches(dim) {
+  const maxLog = Math.log(order.length + 1);
+  const thickness = i => Math.log(downstream[i] + 1) / maxLog;  // 0 at tips, 1 at the trunk
+  const width = t => cell * (0.3 + 1.7 * t * t);
+  for (let k = 1; k < order.length; k++) {
+    const i = order[k], t = thickness(i);
+    segment(i, width(t) * 3.2, `rgba(255,${20 + 30 * t | 0},${20 + 20 * t | 0},${(0.10 + 0.22 * t) * dim})`);
+  }
+  for (let k = 1; k < order.length; k++) {
+    const i = order[k], t = thickness(i);
+    segment(i, width(t), `rgba(255,${70 + 170 * t * t | 0},${70 + 170 * t * t | 0},${(0.45 + 0.5 * t) * dim})`);
+  }
+}
+
+function drawMainChannel() {
+  if (!mainChannel.length) return;
+  const glow = 0.6 + 0.4 * flash;
+  for (const [wd, col] of [[cell * 9, `rgba(255,40,30,${0.10 * glow})`], [cell * 4, `rgba(255,90,70,${0.30 * glow})`], [cell * 1.4, `rgba(255,255,255,${0.95 * glow})`]]) {
+    ctx.strokeStyle = col; ctx.lineWidth = wd; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    let [x, y] = toCanvas(mainChannel[0]); ctx.moveTo(x, y);
+    for (const i of mainChannel.slice(1)) { [x, y] = toCanvas(i); ctx.lineTo(x, y); }
+    [x, y] = toCanvas(src); ctx.lineTo(x, y);
+    ctx.stroke();
+  }
+}
+
+function drawIgnitionPoint() {
+  const [sx, sy] = toCanvas(src);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.beginPath(); ctx.arc(sx, sy, cell * 1.6, 0, 7); ctx.fill();
 }
 
 function drawFinal() {
@@ -247,34 +293,9 @@ function drawFinal() {
   if (flash > 0) { ctx.fillStyle = `rgba(255,220,220,${0.18 * flash})`; ctx.fillRect(0, 0, canvas.width, canvas.height); }
   ctx.globalCompositeOperation = 'lighter';
   ctx.lineCap = 'round';
-  const dim = 1 - 0.55 * Math.min(1, fadeT);
-  const max = Math.log(order.length + 1);
-  // passata 1: alone rosso; passata 2: anima chiara
-  for (let pass = 0; pass < 2; pass++) {
-    for (let k = 1; k < order.length; k++) {
-      const i = order[k];
-      const t = Math.log(kids[i] + 1) / max;           // 0 punte, 1 tronco
-      const wdt = cell * (0.3 + 1.7 * t * t);
-      if (pass === 0) segment(i, wdt * 3.2, `rgba(255,${20 + 30 * t | 0},${20 + 20 * t | 0},${(0.10 + 0.22 * t) * dim})`);
-      else segment(i, wdt, `rgba(255,${70 + 170 * t * t | 0},${70 + 170 * t * t | 0},${(0.45 + 0.5 * t) * dim})`);
-    }
-  }
-  // il canale principale, dal punto toccato al bordo
-  if (finalPath.length) {
-    const glow = 0.6 + 0.4 * flash;
-    for (const [wd, col] of [[cell * 9, `rgba(255,40,30,${0.10 * glow})`], [cell * 4, `rgba(255,90,70,${0.30 * glow})`], [cell * 1.4, `rgba(255,255,255,${0.95 * glow})`]]) {
-      ctx.strokeStyle = col; ctx.lineWidth = wd; ctx.lineJoin = 'round';
-      ctx.beginPath();
-      let [x, y] = px(finalPath[0]); ctx.moveTo(x, y);
-      for (const i of finalPath.slice(1)) { [x, y] = px(i); ctx.lineTo(x, y); }
-      [x, y] = px(src); ctx.lineTo(x, y);
-      ctx.stroke();
-    }
-  }
-  // il punto di innesco
-  const [sx, sy] = px(src);
-  ctx.fillStyle = 'rgba(255,255,255,0.9)';
-  ctx.beginPath(); ctx.arc(sx, sy, cell * 1.6, 0, 7); ctx.fill();
+  drawBranches(1 - 0.55 * Math.min(1, fadeT));
+  drawMainChannel();
+  drawIgnitionPoint();
   ctx.globalCompositeOperation = 'source-over';
 }
 
@@ -283,8 +304,9 @@ function frame(now) {
   const dt = Math.min(0.1, (now - (last || now)) / 1000); last = now;
   if (!done) {
     const t0 = performance.now(), fresh = [];
-    quota = Math.min(quota + dt * RATE, RATE * 0.25);
-    while (quota >= 1 && performance.now() - t0 < FRAME_BUDGET) {
+    // Growth speed follows wall time, not frame rate; slow devices drop growths, not seconds.
+    quota = Math.min(quota + dt * GROWTHS_PER_SECOND, GROWTHS_PER_SECOND * 0.25);
+    while (quota >= 1 && performance.now() - t0 < FRAME_BUDGET_MS) {
       quota--;
       const i = grow();
       if (i < 0) break;
@@ -293,7 +315,7 @@ function frame(now) {
     }
     drawNew(fresh);
     if (strike >= 0 || done) { finish(); drawFinal(); }
-  } else if (finalPath && (flash > 0 || fadeT < 1)) {
+  } else if (mainChannel && (flash > 0 || fadeT < 1)) {
     flash = Math.max(0, flash - dt * 2.5);
     if (flash === 0) fadeT = Math.min(1, fadeT + dt * 0.8);
     drawFinal();
@@ -303,20 +325,25 @@ function frame(now) {
 
 canvas.addEventListener('pointerdown', e => {
   const gx = (e.clientX * dpr - offX) / (W * cell), gy = (e.clientY * dpr - offY) / (H * cell);
-  P.x = Math.min(0.95, Math.max(0.05, gx)); P.y = Math.min(0.95, Math.max(0.05, gy));
-  P.seed = Math.floor(Math.random() * 1e9) >>> 0;
+  params.x = Math.min(0.95, Math.max(0.05, gx)); params.y = Math.min(0.95, Math.max(0.05, gy));
+  params.seed = Math.floor(Math.random() * 1e9) >>> 0;
   hint.style.opacity = 0;
   start();
 });
 
 slider.addEventListener('input', () => { etaLabel.textContent = (+slider.value).toFixed(1); });
-// stesso seme, stesso punto, η diverso: si vede proprio l'effetto del parametro
-slider.addEventListener('change', () => { P.eta = +slider.value; start(); });
+// Keep seed and point on purpose: the same figure with a different eta shows what eta does.
+slider.addEventListener('change', () => { params.eta = +slider.value; start(); });
 
 let resizeTimer;
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => { layout(); if (finalPath) drawFinal(); else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height); drawNew(order.slice(1)); } }, 150);
+  resizeTimer = setTimeout(() => {
+    layout();
+    if (mainChannel) { drawFinal(); return; }
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawNew(order.slice(1));
+  }, 150);
 });
 
 setTimeout(() => { hint.style.opacity = 0; }, 4000);
