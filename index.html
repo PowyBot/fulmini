@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Fulmini · Powy ⚡</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E⚡%3C/text%3E%3C/svg%3E">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #e8e6e1; overflow: hidden; }
+  body { font: 13px/1.4 ui-monospace, Menlo, monospace; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: .9rem; align-items: center; justify-content: center;
+         padding: .7rem 1rem calc(.7rem + env(safe-area-inset-bottom)); color: #8a8580; pointer-events: none; text-shadow: 0 0 6px #000, 0 0 2px #000; }
+  .bar > * { pointer-events: auto; }
+  .bar a { color: #8a8580; text-decoration: none; }
+  label { display: flex; gap: .5rem; align-items: center; }
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 9rem; height: 2px; background: #3a1512; outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #ff3b2a; box-shadow: 0 0 8px #ff3b2a; }
+  input[type=range]::-moz-range-thumb { width: 16px; height: 16px; border: 0; border-radius: 50%; background: #ff3b2a; box-shadow: 0 0 8px #ff3b2a; }
+  #eta { min-width: 2.2em; color: #e8e6e1; }
+  .hint { position: fixed; top: calc(.8rem + env(safe-area-inset-top)); left: 0; right: 0; text-align: center; color: #6b6762; pointer-events: none; transition: opacity 1.5s; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hint" id="hint">tocca per una nuova scarica</div>
+<div class="bar">
+  <label title="esponente di ramificazione: basso = cespuglio, alto = fulmine">η <input id="slider" type="range" min="0.5" max="5" step="0.1"> <span id="eta"></span></label>
+  <a href="https://github.com/PowyBot/fulmini">sorgente</a>
+  <a href="/">powy</a>
+</div>
+<script>
+'use strict';
+// Dielectric breakdown model (Niemeyer, Pietronero, Wiesmann 1984).
+// Il seme della scarica sta a potenziale 0, il bordo a 1. Si risolve Laplace
+// per rilassamento (SOR rosso-nero) e la scarica cresce in una cella vicina
+// con probabilità proporzionale a φ^η. Quando tocca il bordo: colpo di ritorno.
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const slider = document.getElementById('slider');
+const etaLabel = document.getElementById('eta');
+const hint = document.getElementById('hint');
+
+const MAX_CELLS = 42000;   // griglia ragionevole anche per un telefono
+const LOCAL_R = 14;        // raggio della rilassatura locale dopo ogni crescita
+const LOCAL_SWEEPS = 6;
+const GLOBAL_EVERY = 6;    // una passata globale ogni N crescite
+const OMEGA = 1.85;
+const FRAME_BUDGET = 9;    // ms di calcolo per frame, al massimo
+const RATE = 900;          // crescite al secondo, se il telefono ce la fa
+
+let W, H, phi, fixed, parent, order, cand, candPos, rng, eta, src, done, steps, strike;
+let cssW, cssH, dpr, cell, offX, offY, flash = 0, fadeT = 0, finalPath = null, kids = null;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function readParams() {
+  const q = new URLSearchParams(location.search);
+  const num = (k, d) => { const v = parseFloat(q.get(k)); return Number.isFinite(v) ? v : d; };
+  const g = (q.get('g') || '').split('x').map(Number);
+  return {
+    seed: (num('s', Math.floor(Math.random() * 1e9)) >>> 0),
+    eta: Math.min(5, Math.max(0.5, num('eta', 1.6))),
+    x: Math.min(0.95, Math.max(0.05, num('x', 0.5))),
+    y: Math.min(0.95, Math.max(0.05, num('y', 0.5))),
+    g: g.length === 2 && g[0] >= 40 && g[1] >= 40 && g[0] * g[1] <= 90000 ? g : null,
+  };
+}
+
+let P = readParams();
+
+function writeParams() {
+  const q = `?s=${P.seed}&eta=${P.eta.toFixed(1)}&x=${P.x.toFixed(3)}&y=${P.y.toFixed(3)}&g=${W}x${H}`;
+  history.replaceState(null, '', location.pathname + q);
+}
+
+function gridFor(w, h) {
+  const c = Math.max(3, Math.sqrt(w * h / MAX_CELLS));
+  return [Math.round(w / c), Math.round(h / c)];
+}
+
+function layout() {
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  cssW = window.innerWidth; cssH = window.innerHeight;
+  canvas.width = Math.round(cssW * dpr); canvas.height = Math.round(cssH * dpr);
+  // la griglia dei link condivisi resta quella originale: si scala e si centra
+  cell = Math.min(canvas.width / W, canvas.height / H);
+  offX = (canvas.width - W * cell) / 2; offY = (canvas.height - H * cell) / 2;
+}
+
+function start() {
+  if (!P.g) P.g = gridFor(window.innerWidth, window.innerHeight);
+  [W, H] = P.g;
+  layout();
+  eta = P.eta;
+  rng = mulberry32(P.seed);
+  const n = W * H;
+  phi = new Float32Array(n); fixed = new Uint8Array(n); parent = new Int32Array(n).fill(-1);
+  candPos = new Int32Array(n).fill(-1); cand = []; order = [];
+  done = false; steps = 0; strike = -1; finalPath = null; kids = null; flash = 0; fadeT = 0;
+  const sx = Math.round(P.x * (W - 1)), sy = Math.round(P.y * (H - 1));
+  src = sy * W + sx;
+  // stima iniziale logaritmica, poi qualche centinaio di passate per assestarla
+  const R = Math.hypot(Math.max(sx, W - sx), Math.max(sy, H - sy));
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    if (x === 0 || y === 0 || x === W - 1 || y === H - 1) { phi[i] = 1; fixed[i] = 2; continue; }
+    const r = Math.max(1, Math.hypot(x - sx, y - sy));
+    phi[i] = Math.min(1, Math.log(r) / Math.log(R));
+  }
+  for (let k = 0; k < 250; k++) sweep(1, 1, W - 2, H - 2);
+  addToCluster(src, -1);
+  writeParams();
+  slider.value = eta; etaLabel.textContent = eta.toFixed(1);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function sweep(x0, y0, x1, y1) {
+  for (let color = 0; color < 2; color++) {
+    for (let y = y0; y <= y1; y++) {
+      let x = x0 + ((x0 + y + color) & 1);
+      for (let i = y * W + x; x <= x1; x += 2, i += 2) {
+        if (fixed[i]) continue;
+        const avg = 0.25 * (phi[i - 1] + phi[i + 1] + phi[i - W] + phi[i + W]);
+        phi[i] += OMEGA * (avg - phi[i]);
+      }
+    }
+  }
+}
+
+function relaxAround(i) {
+  const x = i % W, y = (i / W) | 0;
+  const x0 = Math.max(1, x - LOCAL_R), x1 = Math.min(W - 2, x + LOCAL_R);
+  const y0 = Math.max(1, y - LOCAL_R), y1 = Math.min(H - 2, y + LOCAL_R);
+  for (let k = 0; k < LOCAL_SWEEPS; k++) sweep(x0, y0, x1, y1);
+}
+
+const N8 = [];
+function neighbors(i) {
+  N8.length = 0;
+  const x = i % W, y = (i / W) | 0;
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    if (!dx && !dy) continue;
+    const nx = x + dx, ny = y + dy;
+    if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+    N8.push(ny * W + nx);
+  }
+  return N8;
+}
+
+function removeCand(i) {
+  const p = candPos[i];
+  if (p < 0) return;
+  const last = cand.pop();
+  if (last !== i) { cand[p] = last; candPos[last] = p; }
+  candPos[i] = -1;
+}
+
+function addToCluster(i, from) {
+  removeCand(i);
+  fixed[i] = 1; phi[i] = 0; parent[i] = from; order.push(i);
+  for (const j of neighbors(i)) {
+    if (fixed[j] === 1 || candPos[j] >= 0) continue;
+    if (fixed[j] === 2) { if (strike < 0) strike = i; continue; }
+    candPos[j] = cand.length; cand.push(j);
+  }
+}
+
+function touchesOrtho(i) {
+  const x = i % W;
+  return fixed[i - W] === 1 || fixed[i + W] === 1 || (x > 0 && fixed[i - 1] === 1) || (x < W - 1 && fixed[i + 1] === 1);
+}
+
+// genitore: la cella del cluster più vicina (preferendo i vicini ortogonali)
+function pickParent(i) {
+  const x = i % W;
+  const ortho = [i - W, i + W, x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1];
+  const opts = [];
+  for (const j of ortho) if (j >= 0 && fixed[j] === 1) opts.push(j);
+  if (!opts.length) for (const j of neighbors(i)) if (fixed[j] === 1) opts.push(j);
+  return opts[Math.floor(rng() * opts.length)];
+}
+
+function grow() {
+  let total = 0;
+  const w = new Float64Array(cand.length);
+  for (let k = 0; k < cand.length; k++) {
+    const c = cand[k], p = phi[c];
+    // crescita ∝ campo^η, non potenziale^η: un candidato toccato solo in
+    // diagonale è a distanza √2, altrimenti la figura cresce a X lungo le diagonali
+    const v = p > 0 ? Math.pow(touchesOrtho(c) ? p : p * Math.SQRT1_2, eta) : 0;
+    total += v; w[k] = total;
+  }
+  if (total <= 0) { done = true; return -1; }
+  const r = rng() * total;
+  let lo = 0, hi = cand.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (w[m] < r) lo = m + 1; else hi = m; }
+  const i = cand[lo];
+  const from = pickParent(i);
+  addToCluster(i, from);
+  relaxAround(i);
+  if (++steps % GLOBAL_EVERY === 0) sweep(1, 1, W - 2, H - 2);
+  return i;
+}
+
+// ---- disegno ----
+// ogni cella ha uno spostamento fisso e pseudo-casuale: toglie la scalinata della griglia
+function jit(i, k) { let h = Math.imul(i ^ k, 0x9E3779B1); h ^= h >>> 15; h = Math.imul(h, 0x85EBCA77); h ^= h >>> 13; return ((h >>> 0) / 4294967296 - 0.5) * 0.8; }
+function px(i) { return [offX + (i % W + 0.5 + jit(i, 0x51)) * cell, offY + (((i / W) | 0) + 0.5 + jit(i, 0xA7)) * cell]; }
+
+function segment(i, width, color) {
+  const [x0, y0] = px(parent[i]), [x1, y1] = px(i);
+  ctx.strokeStyle = color; ctx.lineWidth = width;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+}
+
+function drawNew(list) {
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  for (const i of list) segment(i, cell * 1.6, 'rgba(255,40,20,0.22)');
+  for (const i of list) segment(i, Math.max(1, cell * 0.4), 'rgba(255,170,165,0.9)');
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function finish() {
+  done = true;
+  // numero di discendenti: i rami che portano più corrente sono più spessi
+  kids = new Uint32Array(W * H);
+  for (let k = order.length - 1; k > 0; k--) { const i = order[k]; kids[i] += 1; kids[parent[i]] += kids[i]; }
+  finalPath = [];
+  if (strike >= 0) for (let i = strike; i >= 0 && parent[i] >= 0; i = parent[i]) finalPath.push(i);
+  flash = 1;
+}
+
+function drawFinal() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (flash > 0) { ctx.fillStyle = `rgba(255,220,220,${0.18 * flash})`; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  const dim = 1 - 0.55 * Math.min(1, fadeT);
+  const max = Math.log(order.length + 1);
+  // passata 1: alone rosso; passata 2: anima chiara
+  for (let pass = 0; pass < 2; pass++) {
+    for (let k = 1; k < order.length; k++) {
+      const i = order[k];
+      const t = Math.log(kids[i] + 1) / max;           // 0 punte, 1 tronco
+      const wdt = cell * (0.3 + 1.7 * t * t);
+      if (pass === 0) segment(i, wdt * 3.2, `rgba(255,${20 + 30 * t | 0},${20 + 20 * t | 0},${(0.10 + 0.22 * t) * dim})`);
+      else segment(i, wdt, `rgba(255,${70 + 170 * t * t | 0},${70 + 170 * t * t | 0},${(0.45 + 0.5 * t) * dim})`);
+    }
+  }
+  // il canale principale, dal punto toccato al bordo
+  if (finalPath.length) {
+    const glow = 0.6 + 0.4 * flash;
+    for (const [wd, col] of [[cell * 9, `rgba(255,40,30,${0.10 * glow})`], [cell * 4, `rgba(255,90,70,${0.30 * glow})`], [cell * 1.4, `rgba(255,255,255,${0.95 * glow})`]]) {
+      ctx.strokeStyle = col; ctx.lineWidth = wd; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      let [x, y] = px(finalPath[0]); ctx.moveTo(x, y);
+      for (const i of finalPath.slice(1)) { [x, y] = px(i); ctx.lineTo(x, y); }
+      [x, y] = px(src); ctx.lineTo(x, y);
+      ctx.stroke();
+    }
+  }
+  // il punto di innesco
+  const [sx, sy] = px(src);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.beginPath(); ctx.arc(sx, sy, cell * 1.6, 0, 7); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+let last = 0, quota = 0;
+function frame(now) {
+  const dt = Math.min(0.1, (now - (last || now)) / 1000); last = now;
+  if (!done) {
+    const t0 = performance.now(), fresh = [];
+    quota = Math.min(quota + dt * RATE, RATE * 0.25);
+    while (quota >= 1 && performance.now() - t0 < FRAME_BUDGET) {
+      quota--;
+      const i = grow();
+      if (i < 0) break;
+      fresh.push(i);
+      if (strike >= 0) break;
+    }
+    drawNew(fresh);
+    if (strike >= 0 || done) { finish(); drawFinal(); }
+  } else if (finalPath && (flash > 0 || fadeT < 1)) {
+    flash = Math.max(0, flash - dt * 2.5);
+    if (flash === 0) fadeT = Math.min(1, fadeT + dt * 0.8);
+    drawFinal();
+  }
+  requestAnimationFrame(frame);
+}
+
+canvas.addEventListener('pointerdown', e => {
+  const gx = (e.clientX * dpr - offX) / (W * cell), gy = (e.clientY * dpr - offY) / (H * cell);
+  P.x = Math.min(0.95, Math.max(0.05, gx)); P.y = Math.min(0.95, Math.max(0.05, gy));
+  P.seed = Math.floor(Math.random() * 1e9) >>> 0;
+  hint.style.opacity = 0;
+  start();
+});
+
+slider.addEventListener('input', () => { etaLabel.textContent = (+slider.value).toFixed(1); });
+// stesso seme, stesso punto, η diverso: si vede proprio l'effetto del parametro
+slider.addEventListener('change', () => { P.eta = +slider.value; start(); });
+
+let resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { layout(); if (finalPath) drawFinal(); else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height); drawNew(order.slice(1)); } }, 150);
+});
+
+setTimeout(() => { hint.style.opacity = 0; }, 4000);
+start();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
