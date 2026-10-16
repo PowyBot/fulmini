@@ -280,8 +280,8 @@ function groundPosition(i) {
 // One emitter every EMITTER_SPACING_M along each piece: one per grid cell left gaps of silence
 // between arrivals and the thunder crackled like a fire.
 const EMITTER_SPACING_M = 2;
-// Picked by eye on the spectrogram so the loudness falls over the first 2-3 s like the recordings.
-const ABSORPTION_M = 900;
+// With the loudness-curve match below: farther stretches fade fast enough that the first arrival dominates.
+const ABSORPTION_M = 400;
 const RETURN_STROKE_BOOST = 2;
 const RETURN_STROKE_DECAY_M = 600;
 
@@ -352,6 +352,12 @@ function synthesizeThunder() {
 const ROAR_SMOOTH_S = 0.12;
 const ROAR_CONTRAST = 1.8;
 const CLAPS = 6;
+// Levels set by matching the loudness curve of "Thunder crack 2B" (RMS per 0.25 s): one hit, about
+// -10 dB after 2 s, a tail near -20 dB at 7 s. Louder claps and roar made a 3 s plateau, a stream
+// of sound instead of a strike.
+const CLAP_LEVEL = 0.2;
+const CLAP_DECAY_S = 1.5;
+const ROAR_LEVEL = 0.25;
 const CLAP_GAP_S = 0.35;
 const CRACKLE_LEVEL = 0.15;
 const FADE_OUT_S = 0.5;
@@ -371,9 +377,9 @@ function mixRumble(samples) {
     roarBand[s] = roar * level ** ROAR_CONTRAST;
     roarPeak = Math.max(roarPeak, Math.abs(roarBand[s])); crackPeak = Math.max(crackPeak, Math.abs(samples[s]));
   }
-  for (let s = 0; s < samples.length; s++) samples[s] = CRACKLE_LEVEL * samples[s] / crackPeak + roarBand[s] / roarPeak;
+  for (let s = 0; s < samples.length; s++) samples[s] = CRACKLE_LEVEL * samples[s] / crackPeak + ROAR_LEVEL * roarBand[s] / roarPeak;
   addCrack(samples, 0, 1);
-  for (const [at, height] of clapTimes(env)) addCrack(samples, at, 0.25 + 0.5 * height);
+  for (const [at, height] of clapTimes(env)) addCrack(samples, at, CLAP_LEVEL * height * Math.exp(-at / SAMPLE_RATE / CLAP_DECAY_S));
 }
 
 // The CLAPS highest local maxima of the envelope, at least CLAP_GAP_S apart, skipping the opening
@@ -434,7 +440,7 @@ function playThunder() {
 // higher than physics says because phone speakers play almost nothing below ~200 Hz, where thunder lives.
 // Built once per audio context.
 const THUNDER_CUTOFF_HZ = 2500;
-const ECHO_SECONDS = 5;
+const ECHO_SECONDS = 7;
 const ECHO_CUTOFF_HZ = 300;
 let thunderBus = null;
 
@@ -449,7 +455,7 @@ function thunderOutput() {
   const reverb = audio.createConvolver();
   reverb.buffer = echoImpulse();
   const dry = audio.createGain(), wet = audio.createGain();
-  dry.gain.value = 0.8; wet.gain.value = 0.5;
+  dry.gain.value = 0.8; wet.gain.value = 0.4;
   lowpass.connect(dry).connect(audio.destination);
   // Echoes travel kilometres more than the direct sound, so only the lows come back; a bright reverb
   // smeared the claps into a hiss that never stopped.
@@ -469,7 +475,7 @@ function echoImpulse() {
   let brown = 0;
   for (let s = 0; s < n; s++) {
     brown = 0.95 * brown + 0.3 * (Math.random() * 2 - 1);
-    data[s] = brown * Math.exp(-4 * s / n) * Math.min(1, s / (0.04 * rate));
+    data[s] = brown * Math.exp(-2 * s / n) * Math.min(1, s / (0.04 * rate));
   }
   return ir;
 }
