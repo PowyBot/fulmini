@@ -309,18 +309,45 @@ function synthesizeThunder() {
     const half = Math.max(8, Math.round(1.3 * relaxRadius / SOUND_SPEED * SAMPLE_RATE));
     // The air eats high frequencies with distance; widen the shock fronts instead of filtering.
     const rise = Math.max(2, Math.round((0.0003 + 0.0005 * e.r / 1000) * SAMPLE_RATE));
-    const amp = e.w * e.t * e.t / e.r;
-    const at = Math.round((e.r / SOUND_SPEED - lead) * SAMPLE_RATE);
+    // Emitters 2 m apart with identical pulses arrive at regular intervals and ring as a buzzing
+    // pitch (a comb). Real channels are tortuous below 2 m too: scatter each arrival by up to ±2 ms.
+    const scatter = jitter(e.i, Math.round(e.r * 7)) * 2.5 * 0.002 * SAMPLE_RATE;
+    const amp = e.w * e.t * e.t / e.r * (1 + jitter(e.i, Math.round(e.r * 13)));
+    const at = Math.max(0, Math.round((e.r / SOUND_SPEED - lead) * SAMPLE_RATE + scatter));
     for (let s = 0; s < 2 * half + rise && at + s < samples.length; s++) {
       const ramp = Math.min(1, s / rise, (2 * half + rise - s) / rise);
       samples[at + s] += amp * ramp * (1 - s / half);
     }
   }
+  mixRumble(samples);
   let peak = 0;
   for (const v of samples) peak = Math.max(peak, Math.abs(v));
   // Soft compression: without it the claps are all you hear on a phone speaker.
   for (let s = 0; s < samples.length; s++) samples[s] = Math.tanh(1.5 * samples[s] / peak) / Math.tanh(1.5);
   return { samples, lead, emitters };
+}
+
+// The N-waves alone are a train of clicks: real channels have countless kinks below any grid, and their
+// pulses blur into noise. So the rumble is dark noise shaped by the loudness of the N-wave train
+// (smoothed over RUMBLE_SMOOTH_S); the N-waves stay on top as the crackle of the nearby claps.
+const RUMBLE_SMOOTH_S = 0.03;
+const CRACKLE_LEVEL = 0.35;
+
+function mixRumble(samples) {
+  const follow = 1 / (RUMBLE_SMOOTH_S * SAMPLE_RATE);
+  // Two one-pole low-passes (~350 Hz) and a DC block (~30 Hz) turn white noise into a low roar.
+  const lp = Math.exp(-2 * Math.PI * 350 / SAMPLE_RATE), hp = Math.exp(-2 * Math.PI * 30 / SAMPLE_RATE);
+  let env = 0, a = 0, b = 0, lastB = 0, roar = 0, envPeak = 1e-12, crackPeak = 1e-12;
+  const noise = new Float32Array(samples.length);
+  for (let s = 0; s < samples.length; s++) {
+    env += (Math.abs(samples[s]) - env) * follow;
+    a = lp * a + (1 - lp) * (Math.random() * 2 - 1);
+    b = lp * b + (1 - lp) * a;
+    roar = hp * (roar + b - lastB); lastB = b;
+    noise[s] = roar * env;
+    envPeak = Math.max(envPeak, Math.abs(noise[s])); crackPeak = Math.max(crackPeak, Math.abs(samples[s]));
+  }
+  for (let s = 0; s < samples.length; s++) samples[s] = CRACKLE_LEVEL * samples[s] / crackPeak + noise[s] / envPeak;
 }
 
 function playThunder() {
@@ -331,12 +358,46 @@ function playThunder() {
   stopThunder();
   thunderSource = audio.createBufferSource();
   thunderSource.buffer = buffer;
-  thunderSource.connect(audio.destination);
+  thunderSource.connect(thunderOutput());
   // The light arrives now, the sound after lead seconds: the old count-the-seconds rule, for real.
   thunderSource.start(audio.currentTime + lead);
   thunderStart = audio.currentTime;
   thunderEmitters = emitters;
   thunderLead = lead;
+}
+
+// At a kilometre the air has eaten most of the highs, and the sound reaches you again off the ground,
+// hills and clouds for seconds. Low-pass, then a long reverb made of decaying dark noise. The cutoff is
+// higher than physics says because phone speakers play almost nothing below ~200 Hz, where thunder lives.
+// Built once per audio context.
+const THUNDER_CUTOFF_HZ = 900;
+const ECHO_SECONDS = 3.5;
+let thunderBus = null;
+
+function thunderOutput() {
+  if (thunderBus && thunderBus.context === audio) return thunderBus;
+  const lowpass = audio.createBiquadFilter();
+  lowpass.type = 'lowpass'; lowpass.frequency.value = THUNDER_CUTOFF_HZ; lowpass.Q.value = 0.5;
+  const reverb = audio.createConvolver();
+  reverb.buffer = echoImpulse();
+  const dry = audio.createGain(), wet = audio.createGain();
+  dry.gain.value = 0.7; wet.gain.value = 0.9;
+  lowpass.connect(dry).connect(audio.destination);
+  lowpass.connect(reverb).connect(wet).connect(audio.destination);
+  thunderBus = lowpass;
+  return lowpass;
+}
+
+// Brown noise under an exponential decay: echoes get denser and darker as they come from farther away.
+function echoImpulse() {
+  const n = Math.round(ECHO_SECONDS * SAMPLE_RATE);
+  const ir = audio.createBuffer(1, n, SAMPLE_RATE), data = ir.getChannelData(0);
+  let brown = 0;
+  for (let s = 0; s < n; s++) {
+    brown = 0.985 * brown + 0.15 * (Math.random() * 2 - 1);
+    data[s] = brown * Math.exp(-3 * s / n) * Math.min(1, s / (0.04 * SAMPLE_RATE));
+  }
+  return ir;
 }
 
 function stopThunder() {
