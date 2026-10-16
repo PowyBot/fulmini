@@ -490,8 +490,8 @@ function thunderRadius() {
   return (audio.currentTime - thunderStart) * SOUND_SPEED;
 }
 
-// The sound reaching the listener now left from the points on a sphere around them; its slice
-// through the screen is a circle around the point below their feet.
+const WAVE_SOURCES = 24;
+
 function drawWavefront() {
   const r = thunderRadius();
   const last = thunderEmitters ? thunderEmitters.reduce((a, e) => Math.max(a, e.r), 0) : 0;
@@ -507,10 +507,18 @@ function drawWavefront() {
   ctx.font = `${12 * dpr}px ui-monospace, Menlo, monospace`;
   ctx.textAlign = 'center';
   ctx.fillText(label, footX, markY - 10 * dpr);
-  if (r <= LISTENER_OFFSET_M) return true;
-  const inPlane = Math.sqrt(r * r - LISTENER_OFFSET_M * LISTENER_OFFSET_M) / metersPerCell() * cell;
-  ctx.strokeStyle = 'rgba(160,200,255,0.25)'; ctx.lineWidth = Math.max(1, cell * 0.5);
-  ctx.beginPath(); ctx.arc(footX, footY, inPlane, 0, 7); ctx.stroke();
+  // The waves leave the channel, all of it at the flash, and spread at the speed of sound: one ring
+  // per WAVE_SOURCES points of the main channel, so the front grows out of the lightning itself.
+  // (The listener stands LISTENER_OFFSET_M out of the screen, so a ring reaches them a bit later than
+  // it reaches the point under their feet.)
+  const radius = r / metersPerCell() * cell, step = Math.max(1, Math.floor(mainChannel.length / WAVE_SOURCES));
+  ctx.strokeStyle = `rgba(160,200,255,${0.35 * Math.max(0.25, 1 - r / last)})`; ctx.lineWidth = Math.max(1, cell * 0.5);
+  ctx.beginPath();
+  for (let k = 0; k < mainChannel.length; k += step) {
+    const [x, y] = toCanvas(mainChannel[k]);
+    ctx.moveTo(x + radius, y); ctx.arc(x, y, radius, 0, 7);
+  }
+  ctx.stroke();
   // Light up what you are hearing right now: the pieces within 30 ms of travel from the front.
   ctx.fillStyle = 'rgba(190,220,255,0.9)';
   for (const e of thunderEmitters) {
