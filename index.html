@@ -280,6 +280,10 @@ function groundPosition(i) {
 // One emitter every EMITTER_SPACING_M along each piece: one per grid cell left gaps of silence
 // between arrivals and the thunder crackled like a fire.
 const EMITTER_SPACING_M = 2;
+// Picked by eye on the spectrogram so the loudness falls over the first 2-3 s like the recordings.
+const ABSORPTION_M = 900;
+const RETURN_STROKE_BOOST = 2;
+const RETURN_STROKE_DECAY_M = 600;
 
 function synthesizeThunder() {
   const maxLog = Math.log(order.length + 1);
@@ -288,7 +292,11 @@ function synthesizeThunder() {
   let nearest = Infinity, farthest = 0;
   for (let k = 1; k < order.length; k++) {
     const i = order[k];
-    const t = onMain.has(i) ? 1.6 : Math.log(downstream[i] + 1) / maxLog;
+    // The return stroke carries the most current near the ground and weakens going up, so the bottom of
+    // the main channel is the crack you hear first. Without this the thunder swelled in instead of striking.
+    const height = groundPosition(i)[1];
+    const t = onMain.has(i) ? 1.6 * (1 + RETURN_STROKE_BOOST * Math.exp(-height / RETURN_STROKE_DECAY_M))
+      : Math.log(downstream[i] + 1) / maxLog;
     // Weak twigs would cost time and add only hiss.
     if (t < 0.25) continue;
     const [x0, y0] = groundPosition(parent[i]), [x1, y1] = groundPosition(i);
@@ -312,7 +320,10 @@ function synthesizeThunder() {
     // Emitters 2 m apart with identical pulses arrive at regular intervals and ring as a buzzing
     // pitch (a comb). Real channels are tortuous below 2 m too: scatter each arrival by up to ±2 ms.
     const scatter = jitter(e.i, Math.round(e.r * 7)) * 2.5 * 0.002 * SAMPLE_RATE;
-    const amp = e.w * e.t * e.t / e.r * (1 + jitter(e.i, Math.round(e.r * 13)));
+    // Beyond 1/r spreading, the air absorbs more on a longer path: the first arrival is the crack and
+    // the far end of the channel only rumbles.
+    const absorbed = Math.exp(-(e.r - nearest) / ABSORPTION_M);
+    const amp = e.w * e.t * e.t / e.r * absorbed * (1 + jitter(e.i, Math.round(e.r * 13)));
     const at = Math.max(0, Math.round((e.r / SOUND_SPEED - lead) * SAMPLE_RATE + scatter));
     for (let s = 0; s < 2 * half + rise && at + s < samples.length; s++) {
       const ramp = Math.min(1, s / rise, (2 * half + rise - s) / rise);
@@ -322,29 +333,38 @@ function synthesizeThunder() {
   mixRumble(samples);
   let peak = 0;
   for (const v of samples) peak = Math.max(peak, Math.abs(v));
-  // Soft compression: without it the claps are all you hear on a phone speaker.
-  for (let s = 0; s < samples.length; s++) samples[s] = Math.tanh(1.5 * samples[s] / peak) / Math.tanh(1.5);
+  // Gentle soft clip only: real thunder is a loud crack then quieter claps, and squashing that flat
+  // turned it into a steady roar.
+  const fadeFrom = samples.length - FADE_OUT_S * SAMPLE_RATE;
+  for (let s = 0; s < samples.length; s++) {
+    const fade = s < fadeFrom ? 1 : (samples.length - s) / (FADE_OUT_S * SAMPLE_RATE);
+    samples[s] = fade * Math.tanh(0.8 * samples[s] / peak) / Math.tanh(0.8);
+  }
   return { samples, lead, emitters };
 }
 
 // The N-waves alone are a train of clicks: real channels have countless kinks below any grid, and their
 // pulses blur into noise. So the rumble is dark noise shaped by the loudness of the N-wave train
 // (smoothed over RUMBLE_SMOOTH_S); the N-waves stay on top as the crackle of the nearby claps.
-const RUMBLE_SMOOTH_S = 0.03;
-const CRACKLE_LEVEL = 0.35;
+// Tuned by comparing spectrograms with real recordings (Wikimedia Commons "Thunder 01", "Thunder crack 2B"):
+// those are flat-ish from 40 Hz to ~300 Hz and fall only ~25 dB by 2 kHz, with sharp bursts.
+const RUMBLE_SMOOTH_S = 0.015;
+const RUMBLE_CONTRAST = 1.6;  // envelope^this: claps stand out of the rumble instead of a flat roar
+const CRACKLE_LEVEL = 0.6;
+const FADE_OUT_S = 0.5;
 
 function mixRumble(samples) {
   const follow = 1 / (RUMBLE_SMOOTH_S * SAMPLE_RATE);
-  // Two one-pole low-passes (~350 Hz) and a DC block (~30 Hz) turn white noise into a low roar.
-  const lp = Math.exp(-2 * Math.PI * 350 / SAMPLE_RATE), hp = Math.exp(-2 * Math.PI * 30 / SAMPLE_RATE);
-  let env = 0, a = 0, b = 0, lastB = 0, roar = 0, envPeak = 1e-12, crackPeak = 1e-12;
+  // One one-pole low-pass (~600 Hz) and a DC block (~40 Hz) turn white noise into a roar that still has
+  // some bite; two poles at 350 Hz sounded muffled, like thunder through a wall.
+  const lp = Math.exp(-2 * Math.PI * 600 / SAMPLE_RATE), hp = Math.exp(-2 * Math.PI * 40 / SAMPLE_RATE);
+  let env = 0, a = 0, lastA = 0, roar = 0, envPeak = 1e-12, crackPeak = 1e-12;
   const noise = new Float32Array(samples.length);
   for (let s = 0; s < samples.length; s++) {
     env += (Math.abs(samples[s]) - env) * follow;
     a = lp * a + (1 - lp) * (Math.random() * 2 - 1);
-    b = lp * b + (1 - lp) * a;
-    roar = hp * (roar + b - lastB); lastB = b;
-    noise[s] = roar * env;
+    roar = hp * (roar + a - lastA); lastA = a;
+    noise[s] = roar * env ** RUMBLE_CONTRAST;
     envPeak = Math.max(envPeak, Math.abs(noise[s])); crackPeak = Math.max(crackPeak, Math.abs(samples[s]));
   }
   for (let s = 0; s < samples.length; s++) samples[s] = CRACKLE_LEVEL * samples[s] / crackPeak + noise[s] / envPeak;
@@ -370,22 +390,26 @@ function playThunder() {
 // hills and clouds for seconds. Low-pass, then a long reverb made of decaying dark noise. The cutoff is
 // higher than physics says because phone speakers play almost nothing below ~200 Hz, where thunder lives.
 // Built once per audio context.
-const THUNDER_CUTOFF_HZ = 900;
+const THUNDER_CUTOFF_HZ = 2500;
 const ECHO_SECONDS = 3.5;
 let thunderBus = null;
 
 function thunderOutput() {
   if (thunderBus && thunderBus.context === audio) return thunderBus;
+  // Below ~45 Hz no phone plays anything; that energy only ate headroom and made the rest quieter.
+  const highpass = audio.createBiquadFilter();
+  highpass.type = 'highpass'; highpass.frequency.value = 45; highpass.Q.value = 0.7;
   const lowpass = audio.createBiquadFilter();
   lowpass.type = 'lowpass'; lowpass.frequency.value = THUNDER_CUTOFF_HZ; lowpass.Q.value = 0.5;
+  highpass.connect(lowpass);
   const reverb = audio.createConvolver();
   reverb.buffer = echoImpulse();
   const dry = audio.createGain(), wet = audio.createGain();
-  dry.gain.value = 0.7; wet.gain.value = 0.9;
+  dry.gain.value = 0.8; wet.gain.value = 0.5;
   lowpass.connect(dry).connect(audio.destination);
   lowpass.connect(reverb).connect(wet).connect(audio.destination);
-  thunderBus = lowpass;
-  return lowpass;
+  thunderBus = highpass;
+  return highpass;
 }
 
 // Brown noise under an exponential decay: echoes get denser and darker as they come from farther away.
@@ -396,7 +420,7 @@ function echoImpulse() {
   const ir = audio.createBuffer(1, n, rate), data = ir.getChannelData(0);
   let brown = 0;
   for (let s = 0; s < n; s++) {
-    brown = 0.985 * brown + 0.15 * (Math.random() * 2 - 1);
+    brown = 0.95 * brown + 0.3 * (Math.random() * 2 - 1);
     data[s] = brown * Math.exp(-3 * s / n) * Math.min(1, s / (0.04 * rate));
   }
   return ir;
