@@ -27,6 +27,7 @@
 <div class="hint" id="hint">tocca per una nuova scarica</div>
 <div class="bar">
   <label title="esponente di ramificazione: basso = cespuglio, alto = fulmine">η <input id="slider" type="range" min="0.5" max="5" step="0.1"> <span id="eta"></span></label>
+  <a href="#" id="sound" title="il tuono calcolato dalla forma del fulmine: tu sei a 1 km, in basso al centro">🔇 tuono</a>
   <a href="https://github.com/PowyBot/fulmini">sorgente</a>
   <a href="/">powy</a>
 </div>
@@ -111,7 +112,7 @@ function start() {
   const n = W * H;
   phi = new Float32Array(n); kind = new Uint8Array(n); parent = new Int32Array(n).fill(-1);
   candPos = new Int32Array(n).fill(-1); cand = []; order = [];
-  done = false; steps = 0; strike = -1; mainChannel = null; downstream = null; flash = 0; fadeT = 0;
+  done = false; steps = 0; strike = -1; stopThunder(); mainChannel = null; downstream = null; flash = 0; fadeT = 0;
   const sx = Math.round(params.x * (W - 1)), sy = Math.round(params.y * (H - 1));
   src = sy * W + sx;
   // Start from the 2D point-charge solution (log r) so a few hundred sweeps are enough.
@@ -252,6 +253,131 @@ function finish() {
   mainChannel = [];
   if (strike >= 0) for (let i = strike; i >= 0 && parent[i] >= 0; i = parent[i]) mainChannel.push(i);
   flash = 1;
+  if (audio) playThunder();
+}
+
+// Thunder as the sum of the N-waves emitted by every piece of the channel (the tortuous channel
+// model of Few 1969, https://doi.org/10.1029/JB074i027p06926). Each piece is heard after
+// distance / speed of sound, so a stretch that runs across the listener's line of sight arrives
+// all at once (a clap) and a stretch pointing at the listener is spread out (the rumble).
+// The screen is a vertical slice of sky; the listener stands on the ground below its center,
+// LISTENER_OFFSET_M out of the screen.
+const SOUND_SPEED = 343;
+const SKY_HEIGHT_M = 3000;
+const LISTENER_OFFSET_M = 1000;
+const SAMPLE_RATE = 44100;
+
+let audio = null, thunderSource = null, thunderStart = -1, thunderEmitters = null, thunderLead = 0;
+
+function metersPerCell() { return SKY_HEIGHT_M / H; }
+
+// Meters from the listener's feet, which are at the bottom center of the screen.
+function groundPosition(i) {
+  const m = metersPerCell();
+  return [(i % W + 0.5 + jitter(i, 0x51) - W / 2) * m, (H - ((i / W) | 0) - 0.5 - jitter(i, 0xA7)) * m];
+}
+
+// One emitter every EMITTER_SPACING_M along each piece: one per grid cell left gaps of silence
+// between arrivals and the thunder crackled like a fire.
+const EMITTER_SPACING_M = 2;
+
+function synthesizeThunder() {
+  const maxLog = Math.log(order.length + 1);
+  const onMain = new Set(mainChannel);
+  const emitters = [];
+  let nearest = Infinity, farthest = 0;
+  for (let k = 1; k < order.length; k++) {
+    const i = order[k];
+    const t = onMain.has(i) ? 1.6 : Math.log(downstream[i] + 1) / maxLog;
+    // Weak twigs would cost time and add only hiss.
+    if (t < 0.25) continue;
+    const [x0, y0] = groundPosition(parent[i]), [x1, y1] = groundPosition(i);
+    const n = Math.max(1, Math.round(Math.hypot(x1 - x0, y1 - y0) / EMITTER_SPACING_M));
+    for (let s = 1; s <= n; s++) {
+      const r = Math.hypot(x0 + (x1 - x0) * s / n, y0 + (y1 - y0) * s / n, LISTENER_OFFSET_M);
+      emitters.push({ i, r, t, w: 1 / n });
+      nearest = Math.min(nearest, r); farthest = Math.max(farthest, r);
+    }
+  }
+  const lead = nearest / SOUND_SPEED;
+  const samples = new Float32Array(Math.ceil(((farthest - nearest) / SOUND_SPEED + 0.6) * SAMPLE_RATE));
+  for (const e of emitters) {
+    // Few's relaxation radius: a stronger stroke heats a wider column, whose N-wave is longer and lower.
+    // Real channels are a few meters; kept smaller so the N-waves (3 to 12 ms) land where a phone
+    // speaker still plays. The slow pulsing of the claps adds the deep part anyway.
+    const relaxRadius = 0.3 + 0.8 * e.t;
+    const half = Math.max(8, Math.round(1.3 * relaxRadius / SOUND_SPEED * SAMPLE_RATE));
+    // The air eats high frequencies with distance; widen the shock fronts instead of filtering.
+    const rise = Math.max(2, Math.round((0.0003 + 0.0005 * e.r / 1000) * SAMPLE_RATE));
+    const amp = e.w * e.t * e.t / e.r;
+    const at = Math.round((e.r / SOUND_SPEED - lead) * SAMPLE_RATE);
+    for (let s = 0; s < 2 * half + rise && at + s < samples.length; s++) {
+      const ramp = Math.min(1, s / rise, (2 * half + rise - s) / rise);
+      samples[at + s] += amp * ramp * (1 - s / half);
+    }
+  }
+  let peak = 0;
+  for (const v of samples) peak = Math.max(peak, Math.abs(v));
+  // Soft compression: without it the claps are all you hear on a phone speaker.
+  for (let s = 0; s < samples.length; s++) samples[s] = Math.tanh(1.5 * samples[s] / peak) / Math.tanh(1.5);
+  return { samples, lead, emitters };
+}
+
+function playThunder() {
+  if (!mainChannel.length) return;
+  const { samples, lead, emitters } = synthesizeThunder();
+  const buffer = audio.createBuffer(1, samples.length, SAMPLE_RATE);
+  buffer.copyToChannel(samples, 0);
+  stopThunder();
+  thunderSource = audio.createBufferSource();
+  thunderSource.buffer = buffer;
+  thunderSource.connect(audio.destination);
+  // The light arrives now, the sound after lead seconds: the old count-the-seconds rule, for real.
+  thunderSource.start(audio.currentTime + lead);
+  thunderStart = audio.currentTime;
+  thunderEmitters = emitters;
+  thunderLead = lead;
+}
+
+function stopThunder() {
+  if (thunderSource) thunderSource.stop();
+  thunderSource = null; thunderStart = -1; thunderEmitters = null;
+}
+
+function thunderRadius() {
+  if (!audio || thunderStart < 0 || !thunderEmitters) return -1;
+  return (audio.currentTime - thunderStart) * SOUND_SPEED;
+}
+
+// The sound reaching the listener now left from the points on a sphere around them; its slice
+// through the screen is a circle around the point below their feet.
+function drawWavefront() {
+  const r = thunderRadius();
+  const last = thunderEmitters ? thunderEmitters.reduce((a, e) => Math.max(a, e.r), 0) : 0;
+  if (r < 0 || r > last + 50) return false;
+  const footX = offX + W / 2 * cell, footY = offY + H * cell;
+  // Drawn above the bottom bar, not at the true feet, so it stays visible.
+  const markY = footY - 64 * dpr;
+  ctx.fillStyle = 'rgba(160,200,255,0.9)';
+  ctx.beginPath(); ctx.arc(footX, markY, 4 * dpr, 0, 7); ctx.fill();
+  // Count the seconds between flash and sound, as people do: about 3 per kilometer.
+  const heard = r >= thunderLead * SOUND_SPEED;
+  const label = heard ? `${thunderLead.toFixed(1)} s → ${(thunderLead * SOUND_SPEED / 1000).toFixed(1)} km` : `${Math.floor(r / SOUND_SPEED)} s…`;
+  ctx.font = `${12 * dpr}px ui-monospace, Menlo, monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText(label, footX, markY - 10 * dpr);
+  if (r <= LISTENER_OFFSET_M) return true;
+  const inPlane = Math.sqrt(r * r - LISTENER_OFFSET_M * LISTENER_OFFSET_M) / metersPerCell() * cell;
+  ctx.strokeStyle = 'rgba(160,200,255,0.25)'; ctx.lineWidth = Math.max(1, cell * 0.5);
+  ctx.beginPath(); ctx.arc(footX, footY, inPlane, 0, 7); ctx.stroke();
+  // Light up what you are hearing right now: the pieces within 30 ms of travel from the front.
+  ctx.fillStyle = 'rgba(190,220,255,0.9)';
+  for (const e of thunderEmitters) {
+    if (Math.abs(e.r - r) > 10) continue;
+    const [x, y] = toCanvas(e.i);
+    ctx.beginPath(); ctx.arc(x, y, cell * (0.6 + e.t), 0, 7); ctx.fill();
+  }
+  return true;
 }
 
 function drawBranches(dim) {
@@ -297,9 +423,10 @@ function drawFinal() {
   drawMainChannel();
   drawIgnitionPoint();
   ctx.globalCompositeOperation = 'source-over';
+  return drawWavefront();
 }
 
-let last = 0, quota = 0;
+let last = 0, quota = 0, listening = false;
 function frame(now) {
   const dt = Math.min(0.1, (now - (last || now)) / 1000); last = now;
   if (!done) {
@@ -314,11 +441,11 @@ function frame(now) {
       if (strike >= 0) break;
     }
     drawNew(fresh);
-    if (strike >= 0 || done) { finish(); drawFinal(); }
-  } else if (mainChannel && (flash > 0 || fadeT < 1)) {
+    if (strike >= 0 || done) { finish(); listening = drawFinal(); }
+  } else if (mainChannel && (flash > 0 || fadeT < 1 || listening)) {
     flash = Math.max(0, flash - dt * 2.5);
     if (flash === 0) fadeT = Math.min(1, fadeT + dt * 0.8);
-    drawFinal();
+    listening = drawFinal();
   }
   requestAnimationFrame(frame);
 }
@@ -329,6 +456,20 @@ canvas.addEventListener('pointerdown', e => {
   params.seed = Math.floor(Math.random() * 1e9) >>> 0;
   hint.style.opacity = 0;
   start();
+});
+
+const soundToggle = document.getElementById('sound');
+soundToggle.addEventListener('click', e => {
+  e.preventDefault();
+  // Browsers only allow audio started from a tap, so the context is born here.
+  if (!audio) {
+    audio = new AudioContext();
+    soundToggle.textContent = '🔊 tuono';
+    if (mainChannel) { playThunder(); listening = true; }
+    return;
+  }
+  stopThunder(); audio.close(); audio = null;
+  soundToggle.textContent = '🔇 tuono';
 });
 
 slider.addEventListener('input', () => { etaLabel.textContent = (+slider.value).toFixed(1); });
