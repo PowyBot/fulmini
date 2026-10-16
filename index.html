@@ -344,30 +344,73 @@ function synthesizeThunder() {
 }
 
 // The N-waves alone are a train of clicks: real channels have countless kinks below any grid, and their
-// pulses blur into noise. So the rumble is dark noise shaped by the loudness of the N-wave train
-// (smoothed over RUMBLE_SMOOTH_S); the N-waves stay on top as the crackle of the nearby claps.
-// Tuned by comparing spectrograms with real recordings (Wikimedia Commons "Thunder 01", "Thunder crack 2B"):
-// those are flat-ish from 40 Hz to ~300 Hz and fall only ~25 dB by 2 kHz, with sharp bursts.
-const RUMBLE_SMOOTH_S = 0.015;
-const RUMBLE_CONTRAST = 1.6;  // envelope^this: claps stand out of the rumble instead of a flat roar
-const CRACKLE_LEVEL = 0.6;
+// pulses blur into noise. So the rumble is dark noise shaped by the loudness of the N-wave train.
+// Tuned by comparing spectrograms with real recordings (Wikimedia Commons "Thunder 01", "Thunder crack 2B").
+// What they have and a smooth roar lacks: a few distinct claps, broadband and short, with the roar
+// sinking between them. Here the claps sit on the strongest peaks of the arrival envelope, which are the
+// stretches of channel lying across the line of sight (Few's claps); the roar follows env^ROAR_CONTRAST.
+const ROAR_SMOOTH_S = 0.12;
+const ROAR_CONTRAST = 1.8;
+const CLAPS = 6;
+const CLAP_GAP_S = 0.35;
+const CRACKLE_LEVEL = 0.15;
 const FADE_OUT_S = 0.5;
 
 function mixRumble(samples) {
-  const follow = 1 / (RUMBLE_SMOOTH_S * SAMPLE_RATE);
-  // One one-pole low-pass (~600 Hz) and a DC block (~40 Hz) turn white noise into a roar that still has
-  // some bite; two poles at 350 Hz sounded muffled, like thunder through a wall.
-  const lp = Math.exp(-2 * Math.PI * 600 / SAMPLE_RATE), hp = Math.exp(-2 * Math.PI * 40 / SAMPLE_RATE);
-  let env = 0, a = 0, lastA = 0, roar = 0, envPeak = 1e-12, crackPeak = 1e-12;
-  const noise = new Float32Array(samples.length);
+  const slow = 1 / (ROAR_SMOOTH_S * SAMPLE_RATE);
+  const lowPole = Math.exp(-2 * Math.PI * 250 / SAMPLE_RATE), dcPole = Math.exp(-2 * Math.PI * 40 / SAMPLE_RATE);
+  const env = new Float32Array(samples.length), roarBand = new Float32Array(samples.length);
+  let level = 0, low1 = 0, low = 0, lastLow = 0, roar = 0, roarPeak = 1e-12, crackPeak = 1e-12;
   for (let s = 0; s < samples.length; s++) {
-    env += (Math.abs(samples[s]) - env) * follow;
-    a = lp * a + (1 - lp) * (Math.random() * 2 - 1);
-    roar = hp * (roar + a - lastA); lastA = a;
-    noise[s] = roar * env ** RUMBLE_CONTRAST;
-    envPeak = Math.max(envPeak, Math.abs(noise[s])); crackPeak = Math.max(crackPeak, Math.abs(samples[s]));
+    level += (Math.abs(samples[s]) - level) * slow;
+    env[s] = level;
+    // Two poles: with one, the roar kept a -6 dB/octave tail of hiss up to 2 kHz for its whole length.
+    low1 = lowPole * low1 + (1 - lowPole) * (Math.random() * 2 - 1);
+    low = lowPole * low + (1 - lowPole) * low1;
+    roar = dcPole * (roar + low - lastLow); lastLow = low;
+    roarBand[s] = roar * level ** ROAR_CONTRAST;
+    roarPeak = Math.max(roarPeak, Math.abs(roarBand[s])); crackPeak = Math.max(crackPeak, Math.abs(samples[s]));
   }
-  for (let s = 0; s < samples.length; s++) samples[s] = CRACKLE_LEVEL * samples[s] / crackPeak + noise[s] / envPeak;
+  for (let s = 0; s < samples.length; s++) samples[s] = CRACKLE_LEVEL * samples[s] / crackPeak + roarBand[s] / roarPeak;
+  addCrack(samples, 0, 1);
+  for (const [at, height] of clapTimes(env)) addCrack(samples, at, 0.25 + 0.5 * height);
+}
+
+// The CLAPS highest local maxima of the envelope, at least CLAP_GAP_S apart, skipping the opening
+// crack; heights are relative to the highest one.
+function clapTimes(env) {
+  const gap = Math.round(CLAP_GAP_S * SAMPLE_RATE), step = Math.round(0.01 * SAMPLE_RATE);
+  const peaks = [];
+  for (let s = gap; s < env.length - step; s += step) {
+    if (env[s] >= env[s - step] && env[s] > env[s + step]) peaks.push(s);
+  }
+  peaks.sort((a, b) => env[b] - env[a]);
+  const picked = [];
+  for (const s of peaks) {
+    if (picked.length === CLAPS) break;
+    if (picked.some((p) => Math.abs(p - s) < gap)) continue;
+    picked.push(s);
+  }
+  const top = picked.length ? env[picked[0]] : 1;
+  return picked.map((s) => [s, env[s] / top]);
+}
+
+// Real recordings open with a crack: the shock wave of the nearest piece of channel, broadband and the
+// loudest moment, dying into the roar within about a second. The emitters alone gave a slow swell,
+// since the nearest piece is short. White noise for the snap, dark noise for its body. Claps are
+// smaller copies of it.
+const CRACK_S = 1;
+const CRACK_LEVEL = 2.5;
+
+function addCrack(samples, at, scale) {
+  const n = Math.min(samples.length - at, Math.round(CRACK_S * SAMPLE_RATE));
+  let dark = 0;
+  for (let s = 0; s < n; s++) {
+    const t = s / SAMPLE_RATE, white = Math.random() * 2 - 1;
+    dark = 0.95 * dark + 0.05 * white;
+    const snap = Math.exp(-t / 0.05), body = Math.exp(-t / 0.3);
+    samples[at + s] += scale * CRACK_LEVEL * Math.min(1, s / 40) * (0.6 * snap * white + body * 4 * dark);
+  }
 }
 
 function playThunder() {
@@ -391,7 +434,8 @@ function playThunder() {
 // higher than physics says because phone speakers play almost nothing below ~200 Hz, where thunder lives.
 // Built once per audio context.
 const THUNDER_CUTOFF_HZ = 2500;
-const ECHO_SECONDS = 3.5;
+const ECHO_SECONDS = 5;
+const ECHO_CUTOFF_HZ = 300;
 let thunderBus = null;
 
 function thunderOutput() {
@@ -407,7 +451,11 @@ function thunderOutput() {
   const dry = audio.createGain(), wet = audio.createGain();
   dry.gain.value = 0.8; wet.gain.value = 0.5;
   lowpass.connect(dry).connect(audio.destination);
-  lowpass.connect(reverb).connect(wet).connect(audio.destination);
+  // Echoes travel kilometres more than the direct sound, so only the lows come back; a bright reverb
+  // smeared the claps into a hiss that never stopped.
+  const echoTone = audio.createBiquadFilter();
+  echoTone.type = 'lowpass'; echoTone.frequency.value = ECHO_CUTOFF_HZ; echoTone.Q.value = 0.5;
+  lowpass.connect(echoTone).connect(reverb).connect(wet).connect(audio.destination);
   thunderBus = highpass;
   return highpass;
 }
@@ -421,7 +469,7 @@ function echoImpulse() {
   let brown = 0;
   for (let s = 0; s < n; s++) {
     brown = 0.95 * brown + 0.3 * (Math.random() * 2 - 1);
-    data[s] = brown * Math.exp(-3 * s / n) * Math.min(1, s / (0.04 * rate));
+    data[s] = brown * Math.exp(-4 * s / n) * Math.min(1, s / (0.04 * rate));
   }
   return ir;
 }
