@@ -389,13 +389,15 @@ function thunderOutput() {
 }
 
 // Brown noise under an exponential decay: echoes get denser and darker as they come from farther away.
+// A ConvolverNode throws unless its buffer has the context's own sample rate (48 kHz on most phones),
+// so this one is built at audio.sampleRate, not SAMPLE_RATE.
 function echoImpulse() {
-  const n = Math.round(ECHO_SECONDS * SAMPLE_RATE);
-  const ir = audio.createBuffer(1, n, SAMPLE_RATE), data = ir.getChannelData(0);
+  const rate = audio.sampleRate, n = Math.round(ECHO_SECONDS * rate);
+  const ir = audio.createBuffer(1, n, rate), data = ir.getChannelData(0);
   let brown = 0;
   for (let s = 0; s < n; s++) {
     brown = 0.985 * brown + 0.15 * (Math.random() * 2 - 1);
-    data[s] = brown * Math.exp(-3 * s / n) * Math.min(1, s / (0.04 * SAMPLE_RATE));
+    data[s] = brown * Math.exp(-3 * s / n) * Math.min(1, s / (0.04 * rate));
   }
   return ir;
 }
